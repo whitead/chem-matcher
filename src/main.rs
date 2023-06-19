@@ -3,10 +3,15 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::error::Error;
 use std::path::Path;
-use aho_corasick::{AhoCorasick};
 use structopt::StructOpt;
 use indicatif::{ProgressBar, ProgressStyle};
+use reqwest;
+use std::collections::HashSet;
+use rust_stemmers::{Algorithm, Stemmer};
 
+const WORD_SPLITS: &[char] = &[' ', '\t', '\n', '\r', ',', '.', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '<', '>', '"', '\''];
+const MIN_WORD_LENGTH: usize = 5;
+const BANNED: &str = "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt";
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "key-search")]
@@ -20,7 +25,6 @@ struct Opt {
     text_files: Vec<std::path::PathBuf>,
 }
 
-
 fn estimate_lines (file_path: &str) -> Result<usize, Box<dyn Error>> {
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
@@ -28,17 +32,66 @@ fn estimate_lines (file_path: &str) -> Result<usize, Box<dyn Error>> {
     Ok(line_count)
 }
 
+struct StemmerWrapper {
+    stemmer: Stemmer,
+}
+
+impl StemmerWrapper{
+    pub fn new() -> StemmerWrapper {
+        StemmerWrapper {
+            stemmer: Stemmer::create(Algorithm::English),
+        }
+    }
+
+    pub fn standardize(&self, word: &str) -> String {
+        self.stemmer.stem(word.trim().to_lowercase().as_str()).to_string()
+    }
+}
+
+
+fn to_ascii_titlecase(s: &str) -> String {
+    let mut titlecased = s.to_owned();
+    if let Some(r) = titlecased.get_mut(0..1) {
+        r.make_ascii_uppercase();
+    }
+    titlecased
+}
+
+fn fetch_words_from_url(url: &str) -> Result<HashSet<String>, Box<dyn Error>> {
+    let response = reqwest::blocking::get(url)?;
+    let pb = ProgressBar::new(20000 as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("fetching common words [{elapsed_precise}] {bar} {pos}/{len} ({eta})")?
+            .progress_chars("█░"),
+    );
+    let stemmer = StemmerWrapper::new();
+    let words: HashSet<String> = response
+        .text()?
+        .split_whitespace()
+        .filter(|word| !word.starts_with('#'))
+        .map(|word| {
+            pb.inc(1);
+            stemmer.standardize(word)
+        })
+        .collect();
+    pb.finish();
+    Ok(words)
+}
+
 // Read CSV file and returns a HashMap with key-value pairs
-fn parse_csv(file_path: &str) -> Result<HashMap<String, String>, Box<dyn Error>> {
+fn parse_csv(file_path: &str, banned: &HashSet<String>) -> Result<HashMap<String, String>, Box<dyn Error>> {
     let estimate = estimate_lines(file_path)?;
     let mut map = HashMap::with_capacity(estimate);
+    let stemmer = StemmerWrapper::new();
 
     let content = fs::read_to_string(file_path)?;
+    let mut skipped = 0;
 
     let pb = ProgressBar::new(estimate as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] {bar} {pos}/{len} ({eta})")?
+            .template("building synonym map [{elapsed_precise}] {bar} {pos}/{len} ({eta})")?
             .progress_chars("█░"),
     );
 
@@ -47,12 +100,18 @@ fn parse_csv(file_path: &str) -> Result<HashMap<String, String>, Box<dyn Error>>
         if split.len() == 2 {
             let value = split[0].trim().to_string();
             let key = split[1].trim().to_string();
-            map.insert(key, value);
+            if key.len() >= MIN_WORD_LENGTH && !banned.contains(stemmer.standardize(&key).as_str()) {
+                map.insert(to_ascii_titlecase(&key), value);
+            } else {
+                skipped += 1;
+            }
         }
         pb.inc(1);
     }
-
     pb.finish();
+
+    println!("Skipped {} words", skipped);
+
     Ok(map)
 }
 
@@ -62,26 +121,26 @@ fn read_text_file(file_path: &str) -> Result<String, Box<dyn Error>> {
     Ok(content)
 }
 
+
 // Find the hashmap keys in the input text and return a Vec with the character indices and associated values.
-fn search_keys_in_text(ac: &AhoCorasick, map: &HashMap<String, String>, text: &str) -> Vec<(String, String)> {
-    let patterns: Vec<&str> = map.keys().map(|key| key.as_str()).collect();
-
+fn search_keys_in_text(map: &HashMap<String, String>, text: &str) -> Vec<(usize, String)> {
     let mut search_results = Vec::new();
-
-    for mat in ac.find_iter(text) {
-            let key = patterns[mat.pattern()];
-            if let Some(value) = map.get(key) {
-                search_results.push((key.to_string(), value.to_string()));
-            }
+    let mut count: usize = 0;
+    text.split(WORD_SPLITS).map(|word| {
+        count += word.len() + 1;
+        let word = to_ascii_titlecase(word);
+        if word.len() >= MIN_WORD_LENGTH && map.contains_key(&word) {
+            let value = map.get(&word).unwrap();
+            let index = count - word.len() - 1;
+            search_results.push((index, word.to_string()));
         }
+    }).count();
 
-        //search_results.sort_by_key(|(index, _)| *index);
-
-        search_results
+    search_results
 }
 
 // Generate the report in a readable format
-fn generate_report(search_results: Vec<(String, String)>, file_name: &str) -> String {
+fn generate_report(search_results: Vec<(usize, String)>, file_name: &str) -> String {
     let mut report = format!("Report for {}:\n", file_name);
 
     for (index, value) in search_results {
@@ -94,19 +153,14 @@ fn generate_report(search_results: Vec<(String, String)>, file_name: &str) -> St
 fn main() {
     let opt = Opt::from_args();
 
-    let map = match parse_csv(&opt.csv_file) {
+    let banned = fetch_words_from_url(BANNED).unwrap();
+    let map = match parse_csv(&opt.csv_file, &banned) {
         Ok(map) => map,
         Err(err) => {
             eprintln!("Error parsing CSV file: {}", err);
             return;
         }
     };
-
-    let patterns: Vec<&str> = map.keys().map(|key| key.as_str()).collect();
-    let ac = AhoCorasick::builder()
-        .ascii_case_insensitive(true)
-        .build(&patterns)
-        .unwrap();
 
     for text_file in opt.text_files {
         let text = match read_text_file(text_file.to_str().unwrap()) {
@@ -117,7 +171,7 @@ fn main() {
             }
         };
 
-        let search_results = search_keys_in_text(&ac, &map, &text);
+        let search_results = search_keys_in_text(&map, &text);
         let report = generate_report(search_results, Path::new(&text_file).file_name().unwrap().to_str().unwrap());
 
         println!("{}", report);
@@ -129,17 +183,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_standardize() {
+        let stemmer = StemmerWrapper::new();
+        let banned = fetch_words_from_url(BANNED).unwrap();
+        assert!(banned.contains(stemmer.standardize("pathways").as_str()));
+        assert!(!banned.contains(stemmer.standardize("Acetaminophen").as_str()));
+    }
+
+    #[test]
     fn test_parse_csv() {
         let content = "test\texample\nhello\tworld";
+        let mut banned = HashSet::new();
+        banned.insert("exampl".to_string());
         let (dir, filename) = (std::env::temp_dir(), "test.csv");
         let file_path = dir.join(filename);
         fs::write(&file_path, content).unwrap();
 
-        let map = parse_csv(file_path.to_str().unwrap()).unwrap();
+        let map = parse_csv(file_path.to_str().unwrap(), &banned).unwrap();
 
         let mut expected_map = HashMap::new();
-        expected_map.insert("example".to_string(), "test".to_string());
-        expected_map.insert("world".to_string(), "hello".to_string());
+        //expected_map.insert("example".to_string(), "test".to_string());
+        expected_map.insert("World".to_string(), "hello".to_string());
 
         assert_eq!(map, expected_map);
     }
@@ -163,14 +227,8 @@ mod tests {
         map.insert("orange".to_string(), "fruit".to_string());
         map.insert("carrot".to_string(), "vegetable".to_string());
 
-        let patterns: Vec<&str> = map.keys().map(|key| key.as_str()).collect();
-        let ac = AhoCorasick::builder()
-            .ascii_case_insensitive(true)
-            .build(&patterns)
-            .unwrap();
-
         let text = "I have an apple and an orange, but I do not have a carrot.";
-        let search_results = search_keys_in_text(&ac, &map, &text);
+        let search_results = search_keys_in_text(&map, &text);
 
         let expected_results = vec![
             (10, "fruit".to_string()),
