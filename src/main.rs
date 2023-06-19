@@ -128,24 +128,75 @@ fn read_text_file(file_path: &str) -> Result<String, Box<dyn Error>> {
 }
 
 
-// Find the hashmap keys in the input text and return a Vec with the character indices and associated values.
 fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context_window: usize) -> SearchResults<'a> {
     let mut search_results = Vec::new();
     let mut count: usize = 0;
+    let mut last_word = String::new();
+    let mut last_count: usize = 0;
+    let mut last_key = String::new();
+
     text.split(WORD_SPLITS).map(|word| {
         count += word.len() + 1;
-        let word = to_ascii_titlecase(word);
-        if word.len() >= MIN_WORD_LENGTH && map.contains_key(&word) {
-            let value = map.get(&word).unwrap();
-            let index = count - word.len() - 1;
-            let min = if index < context_window / 2 { 0 } else { index - context_window / 2 };
-            let max = if index + context_window / 2 > text.len() { text.len() } else { index + context_window / 2 };
-            search_results.push((&text[min..max], word.to_string(), *value));
+        let title_word = to_ascii_titlecase(word);
+        let mut value: Option<&u32> = None;
+        let mut index = 0;
+
+        last_key.clear();
+        last_key.push_str(&last_word);
+        last_key.push(' ');
+        last_key.push_str(word);
+        if word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_key) {
+            value = map.get(&last_key);
+            index = last_count - last_word.len() - 1;
+        } else if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
+            value = map.get(&last_word);
+            index = count - word.len() - 1;
+            last_key.clear();
+            last_key.push_str(&last_word);
         }
+
+        if value.is_some() {
+            let min = if index < context_window / 2 {
+                0
+            } else {
+                index - context_window / 2
+            };
+
+            let max = if index + context_window / 2 > text.len() {
+                text.len()
+            } else {
+                index + context_window / 2
+            };
+
+            search_results.push((&text[min..max], last_key.to_string(), *value.unwrap()));
+        }
+
+        last_word = title_word.to_string();
+        last_count = count;
     }).count();
+
+    // add the last word
+    if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
+        let value = map.get(&last_word).unwrap();
+        let index = count - last_word.len() - 1;
+        let min = if index < context_window / 2 {
+            0
+        } else {
+            index - context_window / 2
+        };
+
+        let max = if index + context_window / 2 > text.len() {
+            text.len()
+        } else {
+            index + context_window / 2
+        };
+
+        search_results.push((&text[min..max], last_word.to_string(), *value));
+    }
 
     search_results
 }
+
 
 // Generate the report in a readable format
 fn generate_report(search_results: SearchResults, file_name: &str) -> String {
@@ -243,6 +294,27 @@ mod tests {
             (text, "Apple".to_string(), 1),
             (text, "Orange".to_string(), 2),
             (text, "Carrot".to_string(), 3),
+        ];
+
+        assert_eq!(search_results, expected_results);
+    }
+
+    #[test]
+    fn test_search_keys_in_text_cases() {
+        let mut map = HashMap::new();
+        map.insert("Apple juice".to_string(), 1);
+        map.insert("ORANGE".to_string(), 2);
+        map.insert("Carrot".to_string(), 3);
+        map.insert("juice".to_string(), 4);
+        map.insert("Apple".to_string(), 5);
+
+        let text = "I have an apple juice and an ORANGE, but I do not have a CARROT. Apple";
+        let search_results = search_keys_in_text(&map, &text, 250);
+
+        let expected_results = vec![
+            (text, "Apple juice".to_string(), 1),
+            (text, "ORANGE".to_string(), 2),
+            (text, "Apple".to_string(), 5),
         ];
 
         assert_eq!(search_results, expected_results);
