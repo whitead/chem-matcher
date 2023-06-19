@@ -13,6 +13,8 @@ const WORD_SPLITS: &[char] = &[' ', '\t', '\n', '\r', ',', '.', ';', ':', '!', '
 const MIN_WORD_LENGTH: usize = 5;
 const BANNED: &str = "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt";
 
+type SearchResults<'a> = Vec<(&'a str, String, u32)>;
+
 #[derive(StructOpt, Debug)]
 #[structopt(name = "key-search")]
 struct Opt {
@@ -23,6 +25,10 @@ struct Opt {
     /// Text file(s) to search for keys
     #[structopt(short = "t", long = "text", parse(from_os_str))]
     text_files: Vec<std::path::PathBuf>,
+
+    /// Context window size
+    #[structopt(short = "w", long = "window", default_value = "250")]
+    context_window: usize,
 }
 
 fn estimate_lines (file_path: &str) -> Result<usize, Box<dyn Error>> {
@@ -80,7 +86,7 @@ fn fetch_words_from_url(url: &str) -> Result<HashSet<String>, Box<dyn Error>> {
 }
 
 // Read CSV file and returns a HashMap with key-value pairs
-fn parse_csv(file_path: &str, banned: &HashSet<String>) -> Result<HashMap<String, String>, Box<dyn Error>> {
+fn parse_csv(file_path: &str, banned: &HashSet<String>) -> Result<HashMap<String, u32>, Box<dyn Error>> {
     let estimate = estimate_lines(file_path)?;
     let mut map = HashMap::with_capacity(estimate);
     let stemmer = StemmerWrapper::new();
@@ -101,7 +107,7 @@ fn parse_csv(file_path: &str, banned: &HashSet<String>) -> Result<HashMap<String
             let value = split[0].trim().to_string();
             let key = split[1].trim().to_string();
             if key.len() >= MIN_WORD_LENGTH && !banned.contains(stemmer.standardize(&key).as_str()) {
-                map.insert(to_ascii_titlecase(&key), value);
+                map.insert(to_ascii_titlecase(&key), value.parse::<u32>().unwrap());
             } else {
                 skipped += 1;
             }
@@ -123,7 +129,7 @@ fn read_text_file(file_path: &str) -> Result<String, Box<dyn Error>> {
 
 
 // Find the hashmap keys in the input text and return a Vec with the character indices and associated values.
-fn search_keys_in_text(map: &HashMap<String, String>, text: &str) -> Vec<(usize, String)> {
+fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context_window: usize) -> SearchResults<'a> {
     let mut search_results = Vec::new();
     let mut count: usize = 0;
     text.split(WORD_SPLITS).map(|word| {
@@ -132,7 +138,9 @@ fn search_keys_in_text(map: &HashMap<String, String>, text: &str) -> Vec<(usize,
         if word.len() >= MIN_WORD_LENGTH && map.contains_key(&word) {
             let value = map.get(&word).unwrap();
             let index = count - word.len() - 1;
-            search_results.push((index, word.to_string()));
+            let min = if index < context_window / 2 { 0 } else { index - context_window / 2 };
+            let max = if index + context_window / 2 > text.len() { text.len() } else { index + context_window / 2 };
+            search_results.push((&text[min..max], word.to_string(), *value));
         }
     }).count();
 
@@ -140,11 +148,12 @@ fn search_keys_in_text(map: &HashMap<String, String>, text: &str) -> Vec<(usize,
 }
 
 // Generate the report in a readable format
-fn generate_report(search_results: Vec<(usize, String)>, file_name: &str) -> String {
+fn generate_report(search_results: SearchResults, file_name: &str) -> String {
     let mut report = format!("Report for {}:\n", file_name);
 
-    for (index, value) in search_results {
-        report.push_str(&format!("[{}]: {}\n", index, value));
+    for (context, word, cid) in search_results {
+        // show the context window around the word
+        report.push_str(&format!("{} [{}] {}\n", word, cid, context));
     }
 
     report
@@ -171,7 +180,7 @@ fn main() {
             }
         };
 
-        let search_results = search_keys_in_text(&map, &text);
+        let search_results = search_keys_in_text(&map, &text, opt.context_window);
         let report = generate_report(search_results, Path::new(&text_file).file_name().unwrap().to_str().unwrap());
 
         println!("{}", report);
@@ -192,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_parse_csv() {
-        let content = "test\texample\nhello\tworld";
+        let content = "43\texample\n16\tworld";
         let mut banned = HashSet::new();
         banned.insert("exampl".to_string());
         let (dir, filename) = (std::env::temp_dir(), "test.csv");
@@ -203,7 +212,7 @@ mod tests {
 
         let mut expected_map = HashMap::new();
         //expected_map.insert("example".to_string(), "test".to_string());
-        expected_map.insert("World".to_string(), "hello".to_string());
+        expected_map.insert("World".to_string(), 16);
 
         assert_eq!(map, expected_map);
     }
@@ -223,17 +232,17 @@ mod tests {
     #[test]
     fn test_search_keys_in_text() {
         let mut map = HashMap::new();
-        map.insert("apple".to_string(), "fruit".to_string());
-        map.insert("orange".to_string(), "fruit".to_string());
-        map.insert("carrot".to_string(), "vegetable".to_string());
+        map.insert("Apple".to_string(), 1);
+        map.insert("Orange".to_string(), 2);
+        map.insert("Carrot".to_string(), 3);
 
         let text = "I have an apple and an orange, but I do not have a carrot.";
-        let search_results = search_keys_in_text(&map, &text);
+        let search_results = search_keys_in_text(&map, &text, 250);
 
         let expected_results = vec![
-            (10, "fruit".to_string()),
-            (23, "fruit".to_string()),
-            (51, "vegetable".to_string()),
+            (text, "Apple".to_string(), 1),
+            (text, "Orange".to_string(), 2),
+            (text, "Carrot".to_string(), 3),
         ];
 
         assert_eq!(search_results, expected_results);
