@@ -242,19 +242,22 @@ async fn process_files(opt: Opt) -> Result<(), Box<dyn Error>> {
                     generate_report(search_result, &mut writer);
                 },
                 "gz" => {
+                    // TODO: WHY IS IT ALL LOADING INTO RAM??
                     let gz = BufReader::new(GzDecoder::new(File::open(&fp).unwrap()));
-
                     for line in gz.lines() {
-                        match serde_json::from_str::<serde_json::Value>(dbg!(&line.unwrap())) {
+                        match serde_json::from_str::<serde_json::Value>(&line.unwrap()) {
                             Ok(json_data) => {
-                                text = dbg!(json_data[&property].as_str().unwrap().to_string());
-                                let search_result = dbg!(search_keys_in_text(&*map, &text, opt.context_window));
-                                // TODO: keep buffered writer open (maybe compiler will optimize this)
+                                //print out json_data attributes
+
+                                match json_data["content"][&property].as_str() {
+                                    Some(t) => { text = t.to_string(); },
+                                    None => { continue; }
+                                }
+                                let search_result = search_keys_in_text(&*map, &text, opt.context_window);
                                 generate_report(search_result, &mut writer);
                             },
                             Err(e) => {
-                                dbg!(e);
-                                //println!("Error: {}", e);
+                                println!("Error: {}", e);
                                 continue;
                             }
                         }
@@ -279,7 +282,7 @@ async fn process_files(opt: Opt) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let opt = Opt::from_args();
     process_files(opt).await?;
@@ -360,8 +363,8 @@ mod tests {
     async fn test_gz_json_file() {
         let csv_content = "43\tPhenol peroxidase\n16\texample";
         let textf_content =
-            r#"{"text": "this is a Phenol peroxidase of json", "title": "example title", "abstract": "example abstract"}
-            {"text": "this is example 2 of json", "title": "example title", "abstract": "example abstract"}"#;
+            r#"{"content": {"text": "this is a Phenol peroxidase of json", "title": "example title", "abstract": "example abstract"}}
+            {"content": {"text": "this is example 2 of json", "title": "example title", "abstract": "example abstract"}}"#;
 
         let tmp_dir = TempDir::new("rs_temp_dir").unwrap();
         let csv_filename = tmp_dir.path().join("test.csv");
