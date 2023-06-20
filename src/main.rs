@@ -210,8 +210,7 @@ fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context
 
 
 // Generate the report in a readable format
-fn generate_report(search_results: SearchResults, output_path: &Path) {
-    let mut writer = BufWriter::new(File::create(output_path).unwrap());
+fn generate_report(search_results: SearchResults, writer: &mut BufWriter<File>) {
     for (context, word, cid) in search_results {
         // show the context window around the word
         let msg = format!("{} [{}] {}\n", word, cid, context);
@@ -235,21 +234,23 @@ async fn process_files(opt: Opt) -> Result<(), Box<dyn Error>> {
             let mut text: String;
             let ofp = format!("{}_{}", output_file, &index.to_string());
             let output_path = Path::new(&ofp);
+            let mut writer = BufWriter::new(File::create(output_path).unwrap());
             match ext.to_str().unwrap() {
                 "txt" => {
                     text = fs::read_to_string(&fp).unwrap();
                     let search_result = search_keys_in_text(&*map, &text, opt.context_window);
-                    generate_report(search_result, output_path);
+                    generate_report(search_result, &mut writer);
                 },
                 "gz" => {
                     let gz = BufReader::new(GzDecoder::new(File::open(&fp).unwrap()));
 
                     for line in gz.lines() {
-                        match serde_json::from_str::<serde_json::Value>(&line.unwrap()) {
+                        match serde_json::from_str::<serde_json::Value>(dbg!(&line.unwrap())) {
                             Ok(json_data) => {
-                                text = json_data[&property].as_str().unwrap().to_string();
-                                let search_result = search_keys_in_text(&*map, &text, opt.context_window);
-                                generate_report(search_result, output_path);
+                                text = dbg!(json_data[&property].as_str().unwrap().to_string());
+                                let search_result = dbg!(search_keys_in_text(&*map, &text, opt.context_window));
+                                // TODO: keep buffered writer open (maybe compiler will optimize this)
+                                generate_report(search_result, &mut writer);
                             },
                             Err(e) => {
                                 dbg!(e);
@@ -357,9 +358,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_gz_json_file() {
-        let csv_content = "43\texample\n16\tworld";
+        let csv_content = "43\tPhenol peroxidase\n16\texample";
         let textf_content =
-            r#"{"text": "this is an example of json", "title": "example title", "abstract": "example abstract"}
+            r#"{"text": "this is a Phenol peroxidase of json", "title": "example title", "abstract": "example abstract"}
             {"text": "this is example 2 of json", "title": "example title", "abstract": "example abstract"}"#;
 
         let tmp_dir = TempDir::new("rs_temp_dir").unwrap();
@@ -386,6 +387,8 @@ mod tests {
         let result = process_files(opt).await;
         assert!(result.is_ok());
         assert!(read_to_string("output.txt").is_ok());
-        assert_eq!(read_to_string("output.txt").unwrap(), "Example [43] this is an example of json\nExample [43] this is example 2 of json\n");
+        assert_eq!(read_to_string("output.txt").unwrap(), "Phenol peroxidase [43] this is a Phenol peroxidase of json\n");
+        //clean-up
+        fs::remove_file("output.txt").unwrap();
     }
 }
