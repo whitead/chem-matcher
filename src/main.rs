@@ -1,13 +1,21 @@
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::sync::Arc;
+use std::fs::{self, File, read_to_string};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use structopt::StructOpt;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use rust_stemmers::{Algorithm, Stemmer};
+use tokio;
+use flume;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use serde_json::Value;
+use std::io::prelude::*;
+use tempdir::TempDir;
 
 const WORD_SPLITS: &[char] = &[' ', '\t', '\n', '\r', ',', '.', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '<', '>', '"', '\''];
 const MIN_WORD_LENGTH: usize = 5;
@@ -18,13 +26,21 @@ type SearchResults<'a> = Vec<(&'a str, String, u32)>;
 #[derive(StructOpt, Debug)]
 #[structopt(name = "key-search")]
 struct Opt {
-    /// CSV file containing the hashmap key-value pairs
+    ///CSV file containing the JSON key-value pairs
     #[structopt(short = "c", long = "csv")]
     csv_file: String,
 
-    /// Text file(s) to search for keys
-    #[structopt(short = "t", long = "text", parse(from_os_str))]
-    text_files: Vec<std::path::PathBuf>,
+    /// Files (text or gzipped JSON) to search for keys
+    #[structopt(short = "f", long = "files", parse(from_os_str))]
+    files: Vec<std::path::PathBuf>,
+
+    //Output file to write results
+    #[structopt(short = "o", long = "output")]
+    output_file: String,
+
+    //context_window_prop_name
+    #[structopt(short = "p", long = "property", default_value = "text")]
+    property: String,
 
     /// Context window size
     #[structopt(short = "w", long = "window", default_value = "250")]
@@ -63,8 +79,8 @@ fn to_ascii_titlecase(s: &str) -> String {
     titlecased
 }
 
-fn fetch_words_from_url(url: &str) -> Result<HashSet<String>, Box<dyn Error>> {
-    let response = reqwest::blocking::get(url)?;
+async fn fetch_words_from_url(url: &str) -> Result<HashSet<String>, Box<dyn Error>> {
+    let response = reqwest::get(url).await?;
     let pb = ProgressBar::new(20000 as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -73,7 +89,8 @@ fn fetch_words_from_url(url: &str) -> Result<HashSet<String>, Box<dyn Error>> {
     );
     let stemmer = StemmerWrapper::new();
     let words: HashSet<String> = response
-        .text()?
+        .text()
+        .await?
         .split_whitespace()
         .filter(|word| !word.starts_with('#'))
         .map(|word| {
@@ -119,12 +136,6 @@ fn parse_csv(file_path: &str, banned: &HashSet<String>) -> Result<HashMap<String
     println!("Skipped {} words", skipped);
 
     Ok(map)
-}
-
-// Read the text file and return its content as a String
-fn read_text_file(file_path: &str) -> Result<String, Box<dyn Error>> {
-    let content = fs::read_to_string(file_path)?;
-    Ok(content)
 }
 
 
@@ -199,53 +210,89 @@ fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context
 
 
 // Generate the report in a readable format
-fn generate_report(search_results: SearchResults, file_name: &str) -> String {
-    let mut report = format!("Report for {}:\n", file_name);
-
+fn generate_report(search_results: SearchResults, output_path: &Path) {
+    let mut writer = BufWriter::new(File::create(output_path).unwrap());
     for (context, word, cid) in search_results {
         // show the context window around the word
-        report.push_str(&format!("{} [{}] {}\n", word, cid, context));
+        let msg = format!("{} [{}] {}\n", word, cid, context);
+        writer.write_all(msg.as_bytes()).unwrap();
     }
-
-    report
 }
 
-fn main() {
-    let opt = Opt::from_args();
+async fn process_files(opt: Opt) -> Result<(), Box<dyn Error>> {
+    let banned = Arc::new(fetch_words_from_url(BANNED).await.unwrap());
+    let map = Arc::new(parse_csv(&opt.csv_file, &banned)?);
+    let (tx, rx) = flume::unbounded();
 
-    let banned = fetch_words_from_url(BANNED).unwrap();
-    let map = match parse_csv(&opt.csv_file, &banned) {
-        Ok(map) => map,
-        Err(err) => {
-            eprintln!("Error parsing CSV file: {}", err);
-            return;
-        }
-    };
+    for (index, file_path) in opt.files.iter().enumerate() {
+        let property = opt.property.clone();
+        let fp = file_path.to_str().unwrap().to_string();
+        let map: Arc<HashMap<String, u32>> = Arc::clone(&map);
+        let tx = tx.clone();
+        let output_file = opt.output_file.clone();
+        tokio::spawn(async move {
+            let ext = Path::new(&fp).extension().unwrap();
+            let mut text: String;
+            let ofp = format!("{}_{}", output_file, &index.to_string());
+            let output_path = Path::new(&ofp);
+            match ext.to_str().unwrap() {
+                "txt" => {
+                    text = fs::read_to_string(&fp).unwrap();
+                    let search_result = search_keys_in_text(&*map, &text, opt.context_window);
+                    generate_report(search_result, output_path);
+                },
+                "gz" => {
+                    let gz = BufReader::new(GzDecoder::new(File::open(&fp).unwrap()));
 
-    for text_file in opt.text_files {
-        let text = match read_text_file(text_file.to_str().unwrap()) {
-            Ok(text) => text,
-            Err(err) => {
-                eprintln!("Error reading text file: {}", err);
-                continue;
+                    for line in gz.lines() {
+                        match serde_json::from_str::<serde_json::Value>(&line.unwrap()) {
+                            Ok(json_data) => {
+                                text = json_data[&property].as_str().unwrap().to_string();
+                                let search_result = search_keys_in_text(&*map, &text, opt.context_window);
+                                generate_report(search_result, output_path);
+                            },
+                            Err(e) => {
+                                dbg!(e);
+                                //println!("Error: {}", e);
+                                continue;
+                            }
+                        }
+                    }
+                },
+                _ => { panic!("Unsupported file type") }
             }
-        };
-
-        let search_results = search_keys_in_text(&map, &text, opt.context_window);
-        let report = generate_report(search_results, Path::new(&text_file).file_name().unwrap().to_str().unwrap());
-
-        println!("{}", report);
+            // No idea what this pattern is for
+            tx.send(ofp).unwrap();
+        });
     }
+
+    drop(tx);
+
+    // concat all files
+    let mut writer = BufWriter::new(File::create(&opt.output_file).unwrap());
+    for file_path in rx.iter() {
+        let content = fs::read_to_string(&file_path).unwrap();
+        writer.write_all(content.as_bytes()).unwrap();
+        fs::remove_file(file_path).unwrap();
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let opt = Opt::from_args();
+    process_files(opt).await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_standardize() {
+    #[tokio::test]
+    async fn test_standardize() {
         let stemmer = StemmerWrapper::new();
-        let banned = fetch_words_from_url(BANNED).unwrap();
+        let banned = fetch_words_from_url(BANNED).await.unwrap();
         assert!(banned.contains(stemmer.standardize("pathways").as_str()));
         assert!(!banned.contains(stemmer.standardize("Acetaminophen").as_str()));
     }
@@ -266,18 +313,6 @@ mod tests {
         expected_map.insert("World".to_string(), 16);
 
         assert_eq!(map, expected_map);
-    }
-
-    #[test]
-    fn test_read_text_file() {
-        let content = "This is a test";
-        let (dir, filename) = (std::env::temp_dir(), "text.txt");
-        let file_path = dir.join(filename);
-        fs::write(&file_path, content).unwrap();
-
-        let text = read_text_file(file_path.to_str().unwrap()).unwrap();
-
-        assert_eq!(text, content);
     }
 
     #[test]
@@ -318,5 +353,39 @@ mod tests {
         ];
 
         assert_eq!(search_results, expected_results);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_gz_json_file() {
+        let csv_content = "43\texample\n16\tworld";
+        let textf_content =
+            r#"{"text": "this is an example of json", "title": "example title", "abstract": "example abstract"}
+            {"text": "this is example 2 of json", "title": "example title", "abstract": "example abstract"}"#;
+
+        let tmp_dir = TempDir::new("rs_temp_dir").unwrap();
+        let csv_filename = tmp_dir.path().join("test.csv");
+        let text_filename = tmp_dir.path().join("text.json.gz");
+
+        let text_filename_str = text_filename.to_str().unwrap();
+        fs::write(&csv_filename, csv_content).unwrap();
+
+        let file = File::create(text_filename_str).unwrap();
+        let enc = GzEncoder::new(file, Compression::fast());
+        {
+            let mut writer = BufWriter::new(enc);
+            write!(writer, "{}", textf_content).unwrap();
+        }
+
+        let opt = Opt {
+            csv_file: csv_filename.to_str().unwrap().to_string(),
+            files: vec![PathBuf::from(text_filename_str)],
+            output_file: "output.txt".to_string(),
+            property: "text".to_string(),
+            context_window: 250,
+        };
+        let result = process_files(opt).await;
+        assert!(result.is_ok());
+        assert!(read_to_string("output.txt").is_ok());
+        assert_eq!(read_to_string("output.txt").unwrap(), "Example [43] this is an example of json\nExample [43] this is example 2 of json\n");
     }
 }
