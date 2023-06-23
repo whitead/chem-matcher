@@ -15,13 +15,15 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::Value;
 use std::io::prelude::*;
+use regex;
 use tempdir::TempDir;
 
 const WORD_SPLITS: &[char] = &[' ', '\t', '\n', '\r', ',', '.', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '<', '>', '"', '\''];
 const MIN_WORD_LENGTH: usize = 5;
 const BANNED: &str = "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt";
+const MASK: &str = "<|MOLECULE|>";
 
-type SearchResults<'a> = Vec<(&'a str, String, u32)>;
+type SearchResults = Vec<(String, String, u32)>;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "key-search")]
@@ -139,71 +141,58 @@ fn parse_csv(file_path: &str, banned: &HashSet<String>) -> Result<HashMap<String
 }
 
 
-fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context_window: usize) -> SearchResults<'a> {
+fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context_window: usize) -> SearchResults {
     let mut search_results = Vec::new();
-    let mut count: usize = 0;
-    let mut last_word = String::new();
-    let mut last_count: usize = 0;
-    let mut last_key = String::new();
-
-    text.split(WORD_SPLITS).map(|word| {
-        count += word.len() + 1;
-        let title_word = to_ascii_titlecase(word);
-        let mut value: Option<&u32> = None;
-        let mut index = 0;
-
-        last_key.clear();
-        last_key.push_str(&last_word);
-        last_key.push(' ');
-        last_key.push_str(word);
-        if word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_key) {
-            value = map.get(&last_key);
-            index = last_count - last_word.len() - 1;
-        } else if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
-            value = map.get(&last_word);
-            index = count - word.len() - 1;
+    let re = regex::Regex::new(r"\n\n").unwrap();
+    re.split(text).map(|paragraph| {
+        let mut count: usize = 0;
+        let mut last_word = String::new();
+        let mut last_count: usize = 0;
+        let mut last_key = String::new();
+        paragraph.split(WORD_SPLITS).map(|word| {
+            count += word.len() + 1;
+            let title_word = to_ascii_titlecase(word);
+            let mut value: Option<&u32> = None;
+            let mut index = 0;
+    
             last_key.clear();
             last_key.push_str(&last_word);
+            last_key.push(' ');
+            last_key.push_str(word);
+            if word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_key) {
+                value = map.get(&last_key);
+                index = last_count - last_word.len() - 1;
+            } else if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
+                value = map.get(&last_word);
+                index = last_count - last_word.len() - 1;
+                last_key.clear();
+                last_key.push_str(&last_word);
+            }
+            
+            if value.is_some() {
+                // need to copy paragraph so I can mask out the word
+                let mut paragraph = paragraph.to_string();
+                paragraph.replace_range(index..index + last_key.len(), MASK);
+                search_results.push((paragraph, last_key.to_string(), *value.unwrap()));
+            }
+    
+            last_word = title_word.to_string();
+            last_count = count;
+        }).count();
+
+        // add the last word
+        if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
+            let value = map.get(&last_word);
+            let index = count - last_word.len() - 1;
+            if value.is_some() {
+                // need to copy paragraph so I can mask out the word
+                let mut paragraph = paragraph.to_string();
+                paragraph.replace_range(index..index + last_word.len(), MASK);
+                search_results.push((paragraph, last_word.to_string(), *value.unwrap()));
+            }
         }
 
-        if value.is_some() {
-            let min = if index < context_window / 2 {
-                0
-            } else {
-                index - context_window / 2
-            };
-
-            let max = if index + context_window / 2 > text.len() {
-                text.len()
-            } else {
-                index + context_window / 2
-            };
-
-            search_results.push((&text[min..max], last_key.to_string(), *value.unwrap()));
-        }
-
-        last_word = title_word.to_string();
-        last_count = count;
     }).count();
-
-    // add the last word
-    if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
-        let value = map.get(&last_word).unwrap();
-        let index = count - last_word.len() - 1;
-        let min = if index < context_window / 2 {
-            0
-        } else {
-            index - context_window / 2
-        };
-
-        let max = if index + context_window / 2 > text.len() {
-            text.len()
-        } else {
-            index + context_window / 2
-        };
-
-        search_results.push((&text[min..max], last_word.to_string(), *value));
-    }
 
     search_results
 }
@@ -330,9 +319,9 @@ mod tests {
         let search_results = search_keys_in_text(&map, &text, 250);
 
         let expected_results = vec![
-            (text, "Apple".to_string(), 1),
-            (text, "Orange".to_string(), 2),
-            (text, "Carrot".to_string(), 3),
+            ("I have an <|MOLECULE|> and an orange, but I do not have a carrot.".to_string(), "Apple".to_string(), 1),
+            ("I have an apple and an <|MOLECULE|>, but I do not have a carrot.".to_string(), "Orange".to_string(), 2),
+            ("I have an apple and an orange, but I do not have a <|MOLECULE|>.".to_string(), "Carrot".to_string(), 3),
         ];
 
         assert_eq!(search_results, expected_results);
@@ -351,9 +340,9 @@ mod tests {
         let search_results = search_keys_in_text(&map, &text, 250);
 
         let expected_results = vec![
-            (text, "Apple juice".to_string(), 1),
-            (text, "ORANGE".to_string(), 2),
-            (text, "Apple".to_string(), 5),
+            ("I have an <|MOLECULE|> and an ORANGE, but I do not have a CARROT. Apple".to_string(), "Apple juice".to_string(), 1),
+            ("I have an apple juice and an <|MOLECULE|>, but I do not have a CARROT. Apple".to_string(), "ORANGE".to_string(), 2),
+            ("I have an apple juice and an ORANGE, but I do not have a <|MOLECULE|>. Apple".to_string(), "CARROT".to_string(), 3),
         ];
 
         assert_eq!(search_results, expected_results);
