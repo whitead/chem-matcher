@@ -199,10 +199,10 @@ fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context
 
 
 // Generate the report in a readable format
-fn generate_report(search_results: SearchResults, writer: &mut BufWriter<File>) {
+fn generate_report(search_results: SearchResults, writer: &mut BufWriter<File>, paper_id: &str) {
     for (context, word, cid) in search_results {
         // show the context window around the word
-        let msg = format!("{} [{}] {}\n", word, cid, context);
+        let msg = format!("\"{}\",{},\"{}\",{}\n", word, cid, context, paper_id);
         writer.write_all(msg.as_bytes()).unwrap();
     }
 }
@@ -228,12 +228,13 @@ async fn process_files(opt: Opt) -> Result<(), Box<dyn Error>> {
                 "txt" => {
                     text = fs::read_to_string(&fp).unwrap();
                     let search_result = search_keys_in_text(&*map, &text, opt.context_window);
-                    generate_report(search_result, &mut writer);
+                    generate_report(search_result, &mut writer, "");
                 },
                 "gz" => {
                     // TODO: WHY IS IT ALL LOADING INTO RAM??
                     let gz = BufReader::new(GzDecoder::new(File::open(&fp).unwrap()));
                     for line in gz.lines() {
+                        dbg!(&line);
                         match serde_json::from_str::<serde_json::Value>(&line.unwrap()) {
                             Ok(json_data) => {
                                 //print out json_data attributes
@@ -243,7 +244,7 @@ async fn process_files(opt: Opt) -> Result<(), Box<dyn Error>> {
                                     None => { continue; }
                                 }
                                 let search_result = search_keys_in_text(&*map, &text, opt.context_window);
-                                generate_report(search_result, &mut writer);
+                                generate_report(search_result, &mut writer, json_data["paper_id"].as_str().unwrap());
                             },
                             Err(e) => {
                                 println!("Error: {}", e);
@@ -352,8 +353,8 @@ mod tests {
     async fn test_gz_json_file() {
         let csv_content = "43\tPhenol peroxidase\n16\texample";
         let textf_content =
-            r#"{"content": {"text": "this is a Phenol peroxidase of json", "title": "example title", "abstract": "example abstract"}}
-            {"content": {"text": "this is example 2 of json", "title": "example title", "abstract": "example abstract"}}"#;
+            r#"{"paper_id": "533", "content": {"text": "this is a Phenol peroxidase of json", "title": "example title", "abstract": "example abstract"}}
+            {"paper_id": "435", "content": {"text": "this is example 2 of json", "title": "example title", "abstract": "example abstract"}}"#;
 
         let tmp_dir = TempDir::new("rs_temp_dir").unwrap();
         let csv_filename = tmp_dir.path().join("test.csv");
@@ -379,7 +380,7 @@ mod tests {
         let result = process_files(opt).await;
         assert!(result.is_ok());
         assert!(read_to_string("output.txt").is_ok());
-        assert_eq!(read_to_string("output.txt").unwrap(), "Phenol peroxidase [43] this is a <|MOLECULE|> of json\n");
+        assert_eq!(read_to_string("output.txt").unwrap(), "\"Phenol peroxidase\",43,\"this is a <|MOLECULE|> of json\",533\n");
         //clean-up
         fs::remove_file("output.txt").unwrap();
     }
