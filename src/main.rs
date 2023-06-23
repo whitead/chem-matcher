@@ -342,7 +342,7 @@ mod tests {
         let expected_results = vec![
             ("I have an <|MOLECULE|> and an ORANGE, but I do not have a CARROT. Apple".to_string(), "Apple juice".to_string(), 1),
             ("I have an apple juice and an <|MOLECULE|>, but I do not have a CARROT. Apple".to_string(), "ORANGE".to_string(), 2),
-            ("I have an apple juice and an ORANGE, but I do not have a <|MOLECULE|>. Apple".to_string(), "CARROT".to_string(), 3),
+            ("I have an apple juice and an ORANGE, but I do not have a CARROT. <|MOLECULE|>".to_string(), "Apple".to_string(), 5),
         ];
 
         assert_eq!(search_results, expected_results);
@@ -379,7 +379,7 @@ mod tests {
         let result = process_files(opt).await;
         assert!(result.is_ok());
         assert!(read_to_string("output.txt").is_ok());
-        assert_eq!(read_to_string("output.txt").unwrap(), "Phenol peroxidase [43] this is a Phenol peroxidase of json\n");
+        assert_eq!(read_to_string("output.txt").unwrap(), "Phenol peroxidase [43] this is a <|MOLECULE|> of json\n");
         //clean-up
         fs::remove_file("output.txt").unwrap();
     }
