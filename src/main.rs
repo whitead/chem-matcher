@@ -1,30 +1,48 @@
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::sync::Arc;
+use std::fs::{self, File, read_to_string};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use structopt::StructOpt;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use rust_stemmers::{Algorithm, Stemmer};
+use tokio;
+use flume;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use serde_json::Value;
+use std::io::prelude::*;
+use regex;
+use tempdir::TempDir;
 
 const WORD_SPLITS: &[char] = &[' ', '\t', '\n', '\r', ',', '.', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '<', '>', '"', '\''];
 const MIN_WORD_LENGTH: usize = 5;
 const BANNED: &str = "https://raw.githubusercontent.com/first20hours/google-10000-english/master/20k.txt";
+const MASK: &str = "<|MOLECULE|>";
 
-type SearchResults<'a> = Vec<(&'a str, String, u32)>;
+type SearchResults = Vec<(String, String, u32)>;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "key-search")]
 struct Opt {
-    /// CSV file containing the hashmap key-value pairs
+    ///CSV file containing the JSON key-value pairs
     #[structopt(short = "c", long = "csv")]
     csv_file: String,
 
-    /// Text file(s) to search for keys
-    #[structopt(short = "t", long = "text", parse(from_os_str))]
-    text_files: Vec<std::path::PathBuf>,
+    /// Files (text or gzipped JSON) to search for keys
+    #[structopt(short = "f", long = "files", parse(from_os_str))]
+    files: Vec<std::path::PathBuf>,
+
+    //Output file to write results
+    #[structopt(short = "o", long = "output")]
+    output_file: String,
+
+    //context_window_prop_name
+    #[structopt(short = "p", long = "property", default_value = "text")]
+    property: String,
 
     /// Context window size
     #[structopt(short = "w", long = "window", default_value = "250")]
@@ -63,8 +81,8 @@ fn to_ascii_titlecase(s: &str) -> String {
     titlecased
 }
 
-fn fetch_words_from_url(url: &str) -> Result<HashSet<String>, Box<dyn Error>> {
-    let response = reqwest::blocking::get(url)?;
+async fn fetch_words_from_url(url: &str) -> Result<HashSet<String>, Box<dyn Error>> {
+    let response = reqwest::get(url).await?;
     let pb = ProgressBar::new(20000 as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -73,7 +91,8 @@ fn fetch_words_from_url(url: &str) -> Result<HashSet<String>, Box<dyn Error>> {
     );
     let stemmer = StemmerWrapper::new();
     let words: HashSet<String> = response
-        .text()?
+        .text()
+        .await?
         .split_whitespace()
         .filter(|word| !word.starts_with('#'))
         .map(|word| {
@@ -121,131 +140,152 @@ fn parse_csv(file_path: &str, banned: &HashSet<String>) -> Result<HashMap<String
     Ok(map)
 }
 
-// Read the text file and return its content as a String
-fn read_text_file(file_path: &str) -> Result<String, Box<dyn Error>> {
-    let content = fs::read_to_string(file_path)?;
-    Ok(content)
-}
 
-
-fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context_window: usize) -> SearchResults<'a> {
+fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context_window: usize) -> SearchResults {
     let mut search_results = Vec::new();
-    let mut count: usize = 0;
-    let mut last_word = String::new();
-    let mut last_count: usize = 0;
-    let mut last_key = String::new();
-
-    text.split(WORD_SPLITS).map(|word| {
-        count += word.len() + 1;
-        let title_word = to_ascii_titlecase(word);
-        let mut value: Option<&u32> = None;
-        let mut index = 0;
-
-        last_key.clear();
-        last_key.push_str(&last_word);
-        last_key.push(' ');
-        last_key.push_str(word);
-        if word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_key) {
-            value = map.get(&last_key);
-            index = last_count - last_word.len() - 1;
-        } else if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
-            value = map.get(&last_word);
-            index = count - word.len() - 1;
+    let re = regex::Regex::new(r"\n\n").unwrap();
+    re.split(text).map(|paragraph| {
+        let mut count: usize = 0;
+        let mut last_word = String::new();
+        let mut last_count: usize = 0;
+        let mut last_key = String::new();
+        paragraph.split(WORD_SPLITS).map(|word| {
+            count += word.len() + 1;
+            let title_word = to_ascii_titlecase(word);
+            let mut value: Option<&u32> = None;
+            let mut index = 0;
+    
             last_key.clear();
             last_key.push_str(&last_word);
+            last_key.push(' ');
+            last_key.push_str(word);
+            if word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_key) {
+                value = map.get(&last_key);
+                index = last_count - last_word.len() - 1;
+            } else if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
+                value = map.get(&last_word);
+                index = last_count - last_word.len() - 1;
+                last_key.clear();
+                last_key.push_str(&last_word);
+            }
+            
+            if value.is_some() {
+                // need to copy paragraph so I can mask out the word
+                let mut paragraph = paragraph.to_string();
+                paragraph.replace_range(index..index + last_key.len(), MASK);
+                search_results.push((paragraph, last_key.to_string(), *value.unwrap()));
+            }
+    
+            last_word = title_word.to_string();
+            last_count = count;
+        }).count();
+
+        // add the last word
+        if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
+            let value = map.get(&last_word);
+            let index = count - last_word.len() - 1;
+            if value.is_some() {
+                // need to copy paragraph so I can mask out the word
+                let mut paragraph = paragraph.to_string();
+                paragraph.replace_range(index..index + last_word.len(), MASK);
+                search_results.push((paragraph, last_word.to_string(), *value.unwrap()));
+            }
         }
 
-        if value.is_some() {
-            let min = if index < context_window / 2 {
-                0
-            } else {
-                index - context_window / 2
-            };
-
-            let max = if index + context_window / 2 > text.len() {
-                text.len()
-            } else {
-                index + context_window / 2
-            };
-
-            search_results.push((&text[min..max], last_key.to_string(), *value.unwrap()));
-        }
-
-        last_word = title_word.to_string();
-        last_count = count;
     }).count();
-
-    // add the last word
-    if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
-        let value = map.get(&last_word).unwrap();
-        let index = count - last_word.len() - 1;
-        let min = if index < context_window / 2 {
-            0
-        } else {
-            index - context_window / 2
-        };
-
-        let max = if index + context_window / 2 > text.len() {
-            text.len()
-        } else {
-            index + context_window / 2
-        };
-
-        search_results.push((&text[min..max], last_word.to_string(), *value));
-    }
 
     search_results
 }
 
 
 // Generate the report in a readable format
-fn generate_report(search_results: SearchResults, file_name: &str) -> String {
-    let mut report = format!("Report for {}:\n", file_name);
-
+fn generate_report(search_results: SearchResults, writer: &mut BufWriter<File>) {
     for (context, word, cid) in search_results {
         // show the context window around the word
-        report.push_str(&format!("{} [{}] {}\n", word, cid, context));
+        let msg = format!("{} [{}] {}\n", word, cid, context);
+        writer.write_all(msg.as_bytes()).unwrap();
     }
-
-    report
 }
 
-fn main() {
-    let opt = Opt::from_args();
+async fn process_files(opt: Opt) -> Result<(), Box<dyn Error>> {
+    let banned = Arc::new(fetch_words_from_url(BANNED).await.unwrap());
+    let map = Arc::new(parse_csv(&opt.csv_file, &banned)?);
+    let (tx, rx) = flume::unbounded();
 
-    let banned = fetch_words_from_url(BANNED).unwrap();
-    let map = match parse_csv(&opt.csv_file, &banned) {
-        Ok(map) => map,
-        Err(err) => {
-            eprintln!("Error parsing CSV file: {}", err);
-            return;
-        }
-    };
+    for (index, file_path) in opt.files.iter().enumerate() {
+        let property = opt.property.clone();
+        let fp = file_path.to_str().unwrap().to_string();
+        let map: Arc<HashMap<String, u32>> = Arc::clone(&map);
+        let tx = tx.clone();
+        let output_file = opt.output_file.clone();
+        tokio::spawn(async move {
+            let ext = Path::new(&fp).extension().unwrap();
+            let mut text: String;
+            let ofp = format!("{}_{}", output_file, &index.to_string());
+            let output_path = Path::new(&ofp);
+            let mut writer = BufWriter::new(File::create(output_path).unwrap());
+            match ext.to_str().unwrap() {
+                "txt" => {
+                    text = fs::read_to_string(&fp).unwrap();
+                    let search_result = search_keys_in_text(&*map, &text, opt.context_window);
+                    generate_report(search_result, &mut writer);
+                },
+                "gz" => {
+                    // TODO: WHY IS IT ALL LOADING INTO RAM??
+                    let gz = BufReader::new(GzDecoder::new(File::open(&fp).unwrap()));
+                    for line in gz.lines() {
+                        match serde_json::from_str::<serde_json::Value>(&line.unwrap()) {
+                            Ok(json_data) => {
+                                //print out json_data attributes
 
-    for text_file in opt.text_files {
-        let text = match read_text_file(text_file.to_str().unwrap()) {
-            Ok(text) => text,
-            Err(err) => {
-                eprintln!("Error reading text file: {}", err);
-                continue;
+                                match json_data["content"][&property].as_str() {
+                                    Some(t) => { text = t.to_string(); },
+                                    None => { continue; }
+                                }
+                                let search_result = search_keys_in_text(&*map, &text, opt.context_window);
+                                generate_report(search_result, &mut writer);
+                            },
+                            Err(e) => {
+                                println!("Error: {}", e);
+                                continue;
+                            }
+                        }
+                    }
+                },
+                _ => { panic!("Unsupported file type") }
             }
-        };
-
-        let search_results = search_keys_in_text(&map, &text, opt.context_window);
-        let report = generate_report(search_results, Path::new(&text_file).file_name().unwrap().to_str().unwrap());
-
-        println!("{}", report);
+            // No idea what this pattern is for
+            tx.send(ofp).unwrap();
+        });
     }
+
+    drop(tx);
+
+    // concat all files
+    let mut writer = BufWriter::new(File::create(&opt.output_file).unwrap());
+    for file_path in rx.iter() {
+        let content = fs::read_to_string(&file_path).unwrap();
+        writer.write_all(content.as_bytes()).unwrap();
+        fs::remove_file(file_path).unwrap();
+    }
+    Ok(())
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let opt = Opt::from_args();
+    process_files(opt).await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_standardize() {
+    #[tokio::test]
+    async fn test_standardize() {
         let stemmer = StemmerWrapper::new();
-        let banned = fetch_words_from_url(BANNED).unwrap();
+        let banned = fetch_words_from_url(BANNED).await.unwrap();
         assert!(banned.contains(stemmer.standardize("pathways").as_str()));
         assert!(!banned.contains(stemmer.standardize("Acetaminophen").as_str()));
     }
@@ -269,18 +309,6 @@ mod tests {
     }
 
     #[test]
-    fn test_read_text_file() {
-        let content = "This is a test";
-        let (dir, filename) = (std::env::temp_dir(), "text.txt");
-        let file_path = dir.join(filename);
-        fs::write(&file_path, content).unwrap();
-
-        let text = read_text_file(file_path.to_str().unwrap()).unwrap();
-
-        assert_eq!(text, content);
-    }
-
-    #[test]
     fn test_search_keys_in_text() {
         let mut map = HashMap::new();
         map.insert("Apple".to_string(), 1);
@@ -291,9 +319,9 @@ mod tests {
         let search_results = search_keys_in_text(&map, &text, 250);
 
         let expected_results = vec![
-            (text, "Apple".to_string(), 1),
-            (text, "Orange".to_string(), 2),
-            (text, "Carrot".to_string(), 3),
+            ("I have an <|MOLECULE|> and an orange, but I do not have a carrot.".to_string(), "Apple".to_string(), 1),
+            ("I have an apple and an <|MOLECULE|>, but I do not have a carrot.".to_string(), "Orange".to_string(), 2),
+            ("I have an apple and an orange, but I do not have a <|MOLECULE|>.".to_string(), "Carrot".to_string(), 3),
         ];
 
         assert_eq!(search_results, expected_results);
@@ -312,11 +340,47 @@ mod tests {
         let search_results = search_keys_in_text(&map, &text, 250);
 
         let expected_results = vec![
-            (text, "Apple juice".to_string(), 1),
-            (text, "ORANGE".to_string(), 2),
-            (text, "Apple".to_string(), 5),
+            ("I have an <|MOLECULE|> and an ORANGE, but I do not have a CARROT. Apple".to_string(), "Apple juice".to_string(), 1),
+            ("I have an apple juice and an <|MOLECULE|>, but I do not have a CARROT. Apple".to_string(), "ORANGE".to_string(), 2),
+            ("I have an apple juice and an ORANGE, but I do not have a CARROT. <|MOLECULE|>".to_string(), "Apple".to_string(), 5),
         ];
 
         assert_eq!(search_results, expected_results);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_gz_json_file() {
+        let csv_content = "43\tPhenol peroxidase\n16\texample";
+        let textf_content =
+            r#"{"content": {"text": "this is a Phenol peroxidase of json", "title": "example title", "abstract": "example abstract"}}
+            {"content": {"text": "this is example 2 of json", "title": "example title", "abstract": "example abstract"}}"#;
+
+        let tmp_dir = TempDir::new("rs_temp_dir").unwrap();
+        let csv_filename = tmp_dir.path().join("test.csv");
+        let text_filename = tmp_dir.path().join("text.json.gz");
+
+        let text_filename_str = text_filename.to_str().unwrap();
+        fs::write(&csv_filename, csv_content).unwrap();
+
+        let file = File::create(text_filename_str).unwrap();
+        let enc = GzEncoder::new(file, Compression::fast());
+        {
+            let mut writer = BufWriter::new(enc);
+            write!(writer, "{}", textf_content).unwrap();
+        }
+
+        let opt = Opt {
+            csv_file: csv_filename.to_str().unwrap().to_string(),
+            files: vec![PathBuf::from(text_filename_str)],
+            output_file: "output.txt".to_string(),
+            property: "text".to_string(),
+            context_window: 250,
+        };
+        let result = process_files(opt).await;
+        assert!(result.is_ok());
+        assert!(read_to_string("output.txt").is_ok());
+        assert_eq!(read_to_string("output.txt").unwrap(), "Phenol peroxidase [43] this is a <|MOLECULE|> of json\n");
+        //clean-up
+        fs::remove_file("output.txt").unwrap();
     }
 }
