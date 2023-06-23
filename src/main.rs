@@ -244,7 +244,7 @@ async fn process_files(opt: Opt) -> Result<(), Box<dyn Error>> {
                                     None => { continue; }
                                 }
                                 let search_result = search_keys_in_text(&*map, &text, opt.context_window);
-                                generate_report(search_result, &mut writer, json_data["paper_id"].as_str().unwrap());
+                                generate_report(search_result, &mut writer, json_data["corpusid"].as_str().unwrap());
                             },
                             Err(e) => {
                                 println!("Error: {}", e);
@@ -353,8 +353,8 @@ mod tests {
     async fn test_gz_json_file() {
         let csv_content = "43\tPhenol peroxidase\n16\texample";
         let textf_content =
-            r#"{"paper_id": "533", "content": {"text": "this is a Phenol peroxidase of json", "title": "example title", "abstract": "example abstract"}}
-            {"paper_id": "435", "content": {"text": "this is example 2 of json", "title": "example title", "abstract": "example abstract"}}"#;
+            r#"{"corpusid": "533", "content": {"text": "this is a Phenol peroxidase of json", "title": "example title", "abstract": "example abstract"}}
+            {"corpusid": "435", "content": {"text": "this is example 2 of json", "title": "example title", "abstract": "example abstract"}}"#;
 
         let tmp_dir = TempDir::new("rs_temp_dir").unwrap();
         let csv_filename = tmp_dir.path().join("test.csv");
