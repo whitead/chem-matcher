@@ -45,9 +45,6 @@ struct Opt {
     #[structopt(short = "p", long = "property", default_value = "text")]
     property: String,
 
-    /// Context window size
-    #[structopt(short = "w", long = "window", default_value = "250")]
-    context_window: usize,
 }
 
 fn estimate_lines (file_path: &str) -> Result<usize, Box<dyn Error>> {
@@ -78,6 +75,14 @@ fn to_ascii_titlecase(s: &str) -> String {
     let mut titlecased = s.to_owned();
     if let Some(r) = titlecased.get_mut(0..1) {
         r.make_ascii_uppercase();
+    }
+    titlecased
+}
+
+fn from_ascii_titlecase(s: &str) -> String {
+    let mut titlecased = s.to_owned();
+    if let Some(r) = titlecased.get_mut(0..1) {
+        r.make_ascii_lowercase();
     }
     titlecased
 }
@@ -142,7 +147,7 @@ fn parse_csv(file_path: &str, banned: &HashSet<String>) -> Result<HashMap<String
 }
 
 
-fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context_window: usize) -> SearchResults {
+fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str) -> SearchResults {
     let mut search_results = Vec::new();
     let re = regex::Regex::new(r"\n\n").unwrap();
     re.split(text).map(|paragraph| {
@@ -150,30 +155,31 @@ fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context
         let mut last_word = String::new();
         let mut last_count: usize = 0;
         let mut last_key = String::new();
+        let mut seen = HashSet::new(); // we only want to observer a key once
         paragraph.split(WORD_SPLITS).map(|word| {
             count += word.len() + 1;
             let title_word = to_ascii_titlecase(word);
             let mut value: Option<&u32> = None;
-            let mut index = 0;
-    
             last_key.clear();
             last_key.push_str(&last_word);
             last_key.push(' ');
             last_key.push_str(word);
-            if word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_key) {
+            println!("Considering: {} ({})", last_key, word);
+            if word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_key) && !seen.contains(&last_key) {
                 value = map.get(&last_key);
-                index = last_count - last_word.len() - 1;
-            } else if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
+            } else if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) && !seen.contains(&last_word) {
                 value = map.get(&last_word);
-                index = last_count - last_word.len() - 1;
                 last_key.clear();
                 last_key.push_str(&last_word);
             }
             
             if value.is_some() {
                 // need to copy paragraph so I can mask out the word
-                let mut paragraph = paragraph.to_string();
-                paragraph.replace_range(index..index + last_key.len(), MASK);
+                let mut paragraph = paragraph.to_string().replace(&last_key, MASK);
+                paragraph = paragraph.replace(from_ascii_titlecase(&last_key).as_str(), MASK);
+                seen.insert(last_key.to_string());
+                println!("Found: {} ({})", last_key, word);
+                println!("Replacing: {}", paragraph);
                 search_results.push((paragraph, last_key.to_string(), *value.unwrap()));
             }
     
@@ -182,14 +188,14 @@ fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context
         }).count();
 
         // add the last word
-        if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) {
+        if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) && !seen.contains(&last_word) {
             let value = map.get(&last_word);
-            let index = count - last_word.len() - 1;
             if value.is_some() {
                 // need to copy paragraph so I can mask out the word
-                let mut paragraph = paragraph.to_string();
-                paragraph.replace_range(index..index + last_word.len(), MASK);
-                search_results.push((paragraph, last_word.to_string(), *value.unwrap()));
+                let mut paragraph = paragraph.to_string().replace(&last_word, MASK);
+                paragraph = paragraph.replace(from_ascii_titlecase(&last_word).as_str(), MASK);
+                seen.insert(last_word.to_string());
+                search_results.push((paragraph.replace(&last_word, MASK), last_word.to_string(), *value.unwrap()));
             }
         }
 
@@ -203,7 +209,7 @@ fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str, context
 fn generate_report(search_results: SearchResults, writer: &mut BufWriter<File>, paper_id: &str) {
     for (context, word, cid) in search_results {
         // show the context window around the word
-        let msg = format!("\"{}\",{},\"{}\",{}\n", word, cid, context, paper_id);
+        let msg = format!("\"{}\",{},\"{}\",{}\n", word, cid, context.replace("\"", "\\\""), paper_id);
         writer.write_all(msg.as_bytes()).unwrap();
     }
 }
@@ -228,7 +234,7 @@ async fn process_files(opt: Opt) -> Result<(), Box<dyn Error>> {
             match ext.to_str().unwrap() {
                 "txt" => {
                     text = fs::read_to_string(&fp).unwrap();
-                    let search_result = search_keys_in_text(&*map, &text, opt.context_window);
+                    let search_result = search_keys_in_text(&*map, &text);
                     generate_report(search_result, &mut writer, "");
                 },
                 "gz" => {
@@ -260,7 +266,7 @@ async fn process_files(opt: Opt) -> Result<(), Box<dyn Error>> {
                                         //continue; 
                                     }
                                 };
-                                let search_result = search_keys_in_text(&*map, &text, opt.context_window);
+                                let search_result = search_keys_in_text(&*map, &text);
                                 generate_report(search_result, &mut writer, &corpus_id.to_string());
                                 count += 1;
                             },
@@ -335,7 +341,7 @@ mod tests {
         map.insert("Carrot".to_string(), 3);
 
         let text = "I have an apple and an orange, but I do not have a carrot.";
-        let search_results = search_keys_in_text(&map, &text, 250);
+        let search_results = search_keys_in_text(&map, &text);
 
         let expected_results = vec![
             ("I have an <|MOLECULE|> and an orange, but I do not have a carrot.".to_string(), "Apple".to_string(), 1),
@@ -356,12 +362,12 @@ mod tests {
         map.insert("Apple".to_string(), 5);
 
         let text = "I have an apple juice and an ORANGE, but I do not have a CARROT. Apple";
-        let search_results = search_keys_in_text(&map, &text, 250);
+        let search_results = search_keys_in_text(&map, &text);
 
         let expected_results = vec![
             ("I have an <|MOLECULE|> and an ORANGE, but I do not have a CARROT. Apple".to_string(), "Apple juice".to_string(), 1),
             ("I have an apple juice and an <|MOLECULE|>, but I do not have a CARROT. Apple".to_string(), "ORANGE".to_string(), 2),
-            ("I have an apple juice and an ORANGE, but I do not have a CARROT. <|MOLECULE|>".to_string(), "Apple".to_string(), 5),
+            ("I have an <|MOLECULE|> juice and an ORANGE, but I do not have a CARROT. <|MOLECULE|>".to_string(), "Apple".to_string(), 5),
         ];
 
         assert_eq!(search_results, expected_results);
@@ -371,7 +377,7 @@ mod tests {
     async fn test_gz_json_file() {
         let csv_content = "43\tPhenol peroxidase\n16\texample";
         let textf_content =
-            r#"{"corpusid": 533, "content": {"text": "this is a Phenol peroxidase of json", "title": "example title", "abstract": "example abstract"}}
+            r#"{"corpusid": 533, "content": {"text": "this is a Phenol peroxidase of \"json\"", "title": "example title", "abstract": "example abstract"}}
             {"corpusid": 435, "content": {"text": "this is example 2 of json", "title": "example title", "abstract": "example abstract"}}"#;
 
         let tmp_dir = TempDir::new("rs_temp_dir").unwrap();
@@ -393,12 +399,11 @@ mod tests {
             files: vec![PathBuf::from(text_filename_str)],
             output_file: "output.txt".to_string(),
             property: "text".to_string(),
-            context_window: 250,
         };
         let result = process_files(opt).await;
         assert!(result.is_ok());
         assert!(read_to_string("output.txt").is_ok());
-        assert_eq!(read_to_string("output.txt").unwrap(), "\"Phenol peroxidase\",43,\"this is a <|MOLECULE|> of json\",533\n");
+        assert_eq!(read_to_string("output.txt").unwrap(), "\"Phenol peroxidase\",43,\"this is a <|MOLECULE|> of \\\"json\\\"\",533\n");
         //clean-up
         fs::remove_file("output.txt").unwrap();
     }
