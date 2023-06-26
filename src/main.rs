@@ -45,6 +45,10 @@ struct Opt {
     #[structopt(short = "p", long = "property", default_value = "text")]
     property: String,
 
+    //when to stop (number of lines)
+    #[structopt(short = "s", long = "stop", default_value = "0")]
+    stop: usize,
+
 }
 
 fn estimate_lines (file_path: &str) -> Result<usize, Box<dyn Error>> {
@@ -164,7 +168,6 @@ fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str) -> Sear
             last_key.push_str(&last_word);
             last_key.push(' ');
             last_key.push_str(word);
-            println!("Considering: {} ({})", last_key, word);
             if word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_key) && !seen.contains(&last_key) {
                 value = map.get(&last_key);
             } else if last_word.len() >= MIN_WORD_LENGTH && map.contains_key(&last_word) && !seen.contains(&last_word) {
@@ -178,8 +181,6 @@ fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str) -> Sear
                 let mut paragraph = paragraph.to_string().replace(&last_key, MASK);
                 paragraph = paragraph.replace(from_ascii_titlecase(&last_key).as_str(), MASK);
                 seen.insert(last_key.to_string());
-                println!("Found: {} ({})", last_key, word);
-                println!("Replacing: {}", paragraph);
                 search_results.push((paragraph, last_key.to_string(), *value.unwrap()));
             }
     
@@ -209,7 +210,7 @@ fn search_keys_in_text<'a>(map: &'a HashMap<String, u32>, text: &'a str) -> Sear
 fn generate_report(search_results: SearchResults, writer: &mut BufWriter<File>, paper_id: &str) {
     for (context, word, cid) in search_results {
         // show the context window around the word
-        let msg = format!("\"{}\",{},\"{}\",{}\n", word, cid, context.replace("\"", "\\\""), paper_id);
+        let msg = format!("\"{}\",{},\"{}\",{}\n", word, cid, context.replace("\"", "\\\"").replace("\n", "\\n"), paper_id);
         writer.write_all(msg.as_bytes()).unwrap();
     }
 }
@@ -242,12 +243,11 @@ async fn process_files(opt: Opt) -> Result<(), Box<dyn Error>> {
                     let gz = BufReader::new(GzDecoder::new(File::open(&fp).unwrap()));
                     let mut count = 0;
                     for line in gz.lines() {
-                        if count == 1000 {
+                        if opt.stop > 0 && count == opt.stop {
                             break;
                         }
                         // skip empty lines
                         if line.as_ref().unwrap().is_empty() {
-                            println!("echo \"{}\" >> {}", line.unwrap(), &ofp);
                             continue;
                         }
                         match serde_json::from_str::<serde_json::Value>(&line.unwrap()) {
@@ -399,6 +399,7 @@ mod tests {
             files: vec![PathBuf::from(text_filename_str)],
             output_file: "output.txt".to_string(),
             property: "text".to_string(),
+            stop: 0,
         };
         let result = process_files(opt).await;
         assert!(result.is_ok());
